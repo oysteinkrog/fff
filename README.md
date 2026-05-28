@@ -474,6 +474,21 @@ const hits = finder.value.grep("GetOffTheRecordProfile", {
   classifyDefinitions: true,
 });
 
+// Glob-only search: bypasses the query parser and the fuzzy scorer.
+// The pattern is applied as a single Constraint::Glob; results are ranked by
+// frecency. Use this when you already have a literal glob like `*.rs`,
+// `**/*.test.ts`, or `src/**` and don't want fuzzy/multi-token parsing.
+const rustFiles = finder.value.glob("**/*.rs", { pageSize: 100 });
+
+// Opt in to scanning the filesystem root or home directory. Off by default
+// because both produce huge fs-event volume; pass these only when you
+// know what you're doing.
+const allFiles = FileFinder.create({
+  basePath: process.env.HOME!,
+  enableHomeDirScanning: true,
+  // also: enableFsRootScanning: true,
+});
+
 finder.value.destroy();
 ```
 
@@ -577,6 +592,45 @@ int main(void) {
     fff_destroy(handle);
     return 0;
 }
+```
+
+### Versioned options struct (preferred)
+
+For new code, use [`FffCreateOptions`](./crates/fff-c/include/fff.h) — a
+versioned struct that evolves without ABI breaks. C99 designated
+initializers keep call sites readable and zero-init unspecified fields:
+
+```c
+FffResult *res = fff_create_instance_with(&(FffCreateOptions){
+    .version = FFF_CREATE_OPTIONS_VERSION,
+    .base_path = "/path/to/repo",
+    .ai_mode = true,
+    .enable_fs_root_scanning = false,   // off by default
+    .enable_home_dir_scanning = false,  // off by default
+});
+```
+
+The legacy `fff_create_instance` / `fff_create_instance2` functions remain
+for ABI compatibility — they populate an `FffCreateOptions` internally and
+call `fff_create_instance_with`. A second entry point
+`fff_create_instance_with_value` takes the struct **by value** and is
+provided for FFI bindings whose native struct support uses by-value calling
+convention (e.g. Node's `ffi-rs`).
+
+Adding new options later is purely a struct extension — append the field,
+bump `FFF_CREATE_OPTIONS_VERSION`, and both entry points pick it up. No new
+C symbols, no `vN` proliferation.
+
+### Glob-only search
+
+`fff_glob` filters indexed files by a single glob pattern, ranks by frecency,
+paginates — bypasses the regular query parser entirely. Use this when you
+already have a literal glob (`*.rs`, `**/*.test.ts`, `src/**`) and don't want
+fuzzy matching layered on top.
+
+```c
+FffResult *res = fff_glob(handle, "**/*.rs", "", 0, 0, 100);
+// FffSearchResult in res->handle, free with fff_free_search_result.
 ```
 
 ### Notes

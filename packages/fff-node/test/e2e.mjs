@@ -130,6 +130,34 @@ describe("fff-node", { concurrency: 1 }, () => {
     });
   });
 
+  describe("glob", { concurrency: 1 }, () => {
+    it("filters by extension via raw glob pattern", () => {
+      const r = finder.glob("**/*.rs", { pageSize: 50 });
+      assert.ok(r.ok, `glob failed: ${!r.ok ? r.error : ""}`);
+      assert.ok(r.value.items.length > 0, "expected at least one .rs file");
+      for (const item of r.value.items) {
+        assert.ok(item.relativePath.endsWith(".rs"), `unexpected file: ${item.relativePath}`);
+      }
+    });
+
+    it("returns empty result for non-matching pattern", () => {
+      const r = finder.glob("**/this-extension-does-not-exist-anywhere.zzz");
+      assert.ok(r.ok);
+      assert.equal(r.value.items.length, 0);
+    });
+
+    it("rejects empty pattern", () => {
+      const r = finder.glob("");
+      assert.equal(r.ok, false);
+    });
+
+    it("respects pageSize", () => {
+      const r = finder.glob("**/*.rs", { pageSize: 3 });
+      assert.ok(r.ok);
+      assert.ok(r.value.items.length <= 3);
+    });
+  });
+
   describe("grep", { concurrency: 1 }, () => {
     it("finds FffResult in Rust sources", () => {
       // Constrain to .rs files so the assertion doesn't depend on result ordering

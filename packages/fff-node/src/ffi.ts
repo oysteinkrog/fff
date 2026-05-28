@@ -62,6 +62,36 @@ import { createGrepCursor, err } from "./types.js";
 
 const LIBRARY_KEY = "fff_c";
 
+/**
+ * `FffCreateOptions` shape for ffi-rs's `paramsType: [structDef]` channel.
+ * Field order MUST match `crates/fff-c/src/ffi_types.rs::FffCreateOptions`
+ * so ffi-rs's struct-by-value marshalling produces the right layout. New
+ * fields go at the END — appending only.
+ *
+ * `DataType.String` makes ffi-rs allocate a CString per call and write its
+ * pointer into the struct (no manual buffer/address dance). `DataType.U8`
+ * is used for booleans because ffi-rs's struct serializer needs a 1-byte
+ * field to keep alignment in sync with Rust's `bool`.
+ */
+const FFF_CREATE_OPTIONS_STRUCT = {
+  version: DataType.U32,
+  base_path: DataType.String,
+  frecency_db_path: DataType.String,
+  history_db_path: DataType.String,
+  enable_mmap_cache: DataType.U8,
+  enable_content_indexing: DataType.U8,
+  watch: DataType.U8,
+  ai_mode: DataType.U8,
+  log_file_path: DataType.String,
+  log_level: DataType.String,
+  cache_budget_max_files: DataType.U64,
+  cache_budget_max_bytes: DataType.U64,
+  cache_budget_max_file_size: DataType.U64,
+  enable_fs_root_scanning: DataType.U8,
+  enable_home_dir_scanning: DataType.U8,
+};
+const FFF_CREATE_OPTIONS_VERSION = 1;
+
 /** Grep mode constants matching the C API (u8). */
 const GREP_MODE_PLAIN = 0;
 const GREP_MODE_REGEX = 1;
@@ -324,12 +354,22 @@ export type NativeHandle = JsExternal;
 
 /**
  * Create a new file finder instance.
+ *
+ * Uses ffi-rs's native struct support: we describe `FffCreateOptions` as a
+ * `paramsType` and pass a JS object as the `paramsValue`. ffi-rs handles
+ * `DataType.String` field marshalling (allocates the cstring, writes its
+ * pointer into the struct, frees after the call) — no buffer-address dance,
+ * no round-trips, and adding new options later means just one new line in
+ * `FFF_CREATE_OPTIONS_STRUCT` plus the matching field in the JS object.
+ *
+ * Calls `fff_create_instance_with_value` (the by-value calling-convention
+ * adapter for `fff_create_instance_with`).
  */
 export function ffiCreate(
   basePath: string,
   frecencyDbPath: string,
   historyDbPath: string,
-  useUnsafeNoLock: boolean,
+  _useUnsafeNoLock: boolean,
   enableMmapCache: boolean,
   enableContentIndexing: boolean,
   watch: boolean,
@@ -339,42 +379,42 @@ export function ffiCreate(
   cacheBudgetMaxFiles: number,
   cacheBudgetMaxBytes: number,
   cacheBudgetMaxFileSize: number,
+  enableFsRootScanning: boolean,
+  enableHomeDirScanning: boolean,
 ): Result<NativeHandle> {
   loadLibrary();
 
-  const { rawPtr, struct: structData } = callRaw(
-    "fff_create_instance2",
-    [
-      DataType.String, // base_path
-      DataType.String, // frecency_db_path
-      DataType.String, // history_db_path
-      DataType.Boolean, // use_unsafe_no_lock
-      DataType.Boolean, // enable_mmap_cache
-      DataType.Boolean, // enable_content_indexing
-      DataType.Boolean, // watch
-      DataType.Boolean, // ai_mode
-      DataType.String, // log_file_path
-      DataType.String, // log_level
-      DataType.U64, // cache_budget_max_files
-      DataType.U64, // cache_budget_max_bytes
-      DataType.U64, // cache_budget_max_file_size
-    ],
-    [
-      basePath,
-      frecencyDbPath,
-      historyDbPath,
-      useUnsafeNoLock,
-      enableMmapCache,
-      enableContentIndexing,
-      watch,
-      aiMode,
-      logFilePath,
-      logLevel,
-      cacheBudgetMaxFiles,
-      cacheBudgetMaxBytes,
-      cacheBudgetMaxFileSize,
-    ],
-  );
+  const optsValue = {
+    version: FFF_CREATE_OPTIONS_VERSION,
+    base_path: basePath,
+    frecency_db_path: frecencyDbPath,
+    history_db_path: historyDbPath,
+    enable_mmap_cache: enableMmapCache ? 1 : 0,
+    enable_content_indexing: enableContentIndexing ? 1 : 0,
+    watch: watch ? 1 : 0,
+    ai_mode: aiMode ? 1 : 0,
+    log_file_path: logFilePath,
+    log_level: logLevel,
+    cache_budget_max_files: cacheBudgetMaxFiles,
+    cache_budget_max_bytes: cacheBudgetMaxBytes,
+    cache_budget_max_file_size: cacheBudgetMaxFileSize,
+    enable_fs_root_scanning: enableFsRootScanning ? 1 : 0,
+    enable_home_dir_scanning: enableHomeDirScanning ? 1 : 0,
+  };
+
+  const rawPtr = load({
+    library: LIBRARY_KEY,
+    funcName: "fff_create_instance_with_value",
+    retType: DataType.External,
+    paramsType: [FFF_CREATE_OPTIONS_STRUCT],
+    paramsValue: [optsValue],
+    freeResultMemory: false,
+  }) as JsExternal;
+
+  const [structData] = restorePointer({
+    retType: [FFF_RESULT_STRUCT],
+    paramsValue: wrapPointer([rawPtr]),
+  }) as unknown as [FffResultRaw];
 
   const success = structData.success !== 0;
 
@@ -382,7 +422,7 @@ export function ffiCreate(
     if (success) {
       const handle = structData.handle;
       if (isNullPointer(handle)) {
-        return err("fff_create_instance2 returned null handle");
+        return err("fff_create_instance_with_value returned null handle");
       }
       return { ok: true, value: handle };
     } else {
@@ -1200,6 +1240,39 @@ export function ffiSearch(
       comboBoostMultiplier,
       minComboCount,
     ],
+    freeResultMemory: false,
+  }) as JsExternal;
+
+  return parseSearchResult(rawPtr);
+}
+
+/**
+ * Glob-only search. Bypasses the regular query parser, applies the pattern
+ * as a single `Constraint::Glob`, ranks by frecency, paginates.
+ */
+export function ffiGlob(
+  handle: NativeHandle,
+  pattern: string,
+  currentFile: string,
+  maxThreads: number,
+  pageIndex: number,
+  pageSize: number,
+): Result<SearchResult> {
+  loadLibrary();
+
+  const rawPtr = load({
+    library: LIBRARY_KEY,
+    funcName: "fff_glob",
+    retType: DataType.External,
+    paramsType: [
+      DataType.External, // handle
+      DataType.String, // pattern
+      DataType.String, // current_file
+      DataType.U32, // max_threads
+      DataType.U32, // page_index
+      DataType.U32, // page_size
+    ],
+    paramsValue: [handle, pattern, currentFile, maxThreads, pageIndex, pageSize],
     freeResultMemory: false,
   }) as JsExternal;
 
