@@ -138,6 +138,12 @@ pub(crate) struct Args {
 
     /// Disable the content index built after the initial scan.
     /// This makes grep calls slower but consumes less RAM (recommended to not turn off)
+    // Pre-existing bug fix (discovered by axis-D tests): without an explicit
+    // `long` attribute clap treats this as a positional argument and fails a
+    // debug_assert in test builds. The CLI surface continues to advertise
+    // `--no-content-indexing`; release builds happened to silently accept it
+    // as an unrecognised flag rather than honouring it.
+    #[arg(long = "no-content-indexing")]
     no_content_indexing: bool,
 
     /// Explicitly enable content indexing even when `--no-warmup` is set.
@@ -156,9 +162,73 @@ pub(crate) struct Args {
     #[arg(long = "max-cached-files", env = "FFF_MAX_CACHED_FILES")]
     max_cached_files: Option<usize>,
 
+    /// Refuse to start if the initial filesystem walk discovers more than this
+    /// many files. Defaults to 1 000 000, which catches accidental indexing of
+    /// home directories or umbrella directories without firing on legitimately
+    /// large repositories (typical IF Desktop worktree ≈ 690 K files). Set to
+    /// 0 to disable. Also settable via FFF_MAX_INDEXABLE_FILES.
+    #[arg(
+        long = "max-indexable-files",
+        env = "FFF_MAX_INDEXABLE_FILES",
+        default_value_t = 1_000_000
+    )]
+    max_indexable_files: usize,
+
+    /// Refuse to start if the resolved base path is not a git working
+    /// directory. Recommended for MCP launches so a Claude Code session
+    /// opened in a non-repo directory does not silently start indexing the
+    /// user's home tree. Default off in the binary; turn on via MCP config.
+    /// Also settable via FFF_REQUIRE_GIT_ROOT=1.
+    #[arg(long = "require-git-root", env = "FFF_REQUIRE_GIT_ROOT")]
+    require_git_root: bool,
+
+    /// Only allow indexing if the resolved base path is a descendant of one
+    /// of these prefixes. Repeatable. Example:
+    /// `--root-must-be-under /c/WORK --root-must-be-under /home/user/repos`.
+    #[arg(long = "root-must-be-under")]
+    root_must_be_under: Vec<String>,
+
+    /// Validate the resolved base path against `--require-git-root` /
+    /// `--root-must-be-under` rules, then exit 0 (or exit 1 with a JSON line
+    /// on stderr if any check fails). Does not run the file walk; intended
+    /// for wrapper scripts that probe a candidate base path before launching
+    /// the real server.
+    #[arg(long = "validate-root")]
+    validate_root: bool,
+
     /// Run a health check and print diagnostic information, then exit.
     #[arg(long = "healthcheck")]
     pub(crate) healthcheck: bool,
+}
+
+/// Machine-parseable startup error written to stderr (one JSON object per
+/// line) before `std::process::exit(1)`. The MCP host (Claude Code) captures
+/// stderr on process failure and can display `detail` directly. The `code`
+/// field is a stable identifier; `detail` is for human display and may change.
+#[derive(serde::Serialize)]
+struct StartupError<'a> {
+    event: &'a str,
+    code: &'a str,
+    base_path: &'a str,
+    detail: &'a str,
+}
+
+/// Emit a structured startup error and exit non-zero. Writes JSON to stderr
+/// followed by a human-readable line so both machine and human readers see the
+/// failure. Called BEFORE `init_tracing` so the JSON line is never interleaved
+/// with tracing-subscriber output.
+fn emit_startup_error_and_exit(code: &str, base_path: &str, detail: &str) -> ! {
+    let err = StartupError {
+        event: "fff_startup_error",
+        code,
+        base_path,
+        detail,
+    };
+    if let Ok(json) = serde_json::to_string(&err) {
+        eprintln!("{json}");
+    }
+    eprintln!("fff-mcp: {code}: {detail} (base_path={base_path})");
+    std::process::exit(1);
 }
 
 /// Resolve default paths for the log file.
@@ -176,12 +246,29 @@ fn resolve_defaults(args: &mut Args) {
 
     if args.log_file.is_none() {
         let home = dirs_home();
+        let pid = std::process::id();
         let is_windows = cfg!(target_os = "windows");
-        args.log_file = Some(if is_windows {
-            format!("{}\\AppData\\Local\\fff_mcp.log", home)
+        let path = if is_windows {
+            format!("{}\\AppData\\Local\\fff_mcp-{pid}.log", home)
         } else {
-            format!("{}/.cache/fff_mcp.log", home)
-        });
+            format!("{}/.cache/fff_mcp-{pid}.log", home)
+        };
+
+        // Maintain a `fff_mcp-latest.log` symlink for `tail -F` monitoring.
+        // Atomic swap via `rename(2)` so concurrent readers never see a
+        // broken symlink. Best-effort: silent failures on platforms without
+        // unix symlinks or when the cache dir is not writable.
+        #[cfg(unix)]
+        {
+            let latest = format!("{}/.cache/fff_mcp-latest.log", home);
+            let tmp = format!("{}/.cache/.fff_mcp-latest.log.{pid}.tmp", home);
+            let _ = std::fs::remove_file(&tmp);
+            if std::os::unix::fs::symlink(&path, &tmp).is_ok() {
+                let _ = std::fs::rename(&tmp, &latest);
+            }
+        }
+
+        args.log_file = Some(path);
     }
 }
 
@@ -189,6 +276,22 @@ fn dirs_home() -> String {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/tmp".to_string())
+}
+
+/// Resolve the user-supplied base path against the optional git workdir.
+/// Returns `(resolved_base_path, has_git_root)`. Pure function (no logging /
+/// no global state) so it can run BEFORE `init_tracing` for the startup-error
+/// JSON path.
+fn resolve_base_path(raw: &str) -> (String, bool) {
+    match Repository::discover(raw) {
+        Ok(repo) => match repo.workdir() {
+            Some(workdir) => (workdir.to_string_lossy().to_string(), true),
+            // Bare repo — treat as "has git" but use the original path since
+            // there is no workdir to index.
+            None => (raw.to_string(), true),
+        },
+        Err(_) => (raw.to_string(), false),
+    }
 }
 
 #[tokio::main]
@@ -200,37 +303,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return healthcheck::run_healthcheck(&args);
     }
 
-    let log_file = args.log_file.as_deref().unwrap_or("");
-    if let Err(e) = fff::log::init_tracing(log_file, args.log_level.as_deref()) {
-        eprintln!("Warning: Failed to init tracing: {}", e);
-    }
-
-    let base_path = args.base_path.unwrap_or_else(|| {
+    // Compute base_path BEFORE init_tracing so a structured startup error
+    // can be emitted on stderr without tracing-subscriber output being
+    // interleaved with the JSON line (per PLAN-review NB3).
+    let raw_base_path = args.base_path.clone().unwrap_or_else(|| {
         std::env::current_dir()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string()
     });
+    let (base_path, has_git_root) = resolve_base_path(&raw_base_path);
 
-    let base_path = match Repository::discover(&base_path) {
-        Ok(repo) => {
-            if let Some(workdir) = repo.workdir() {
-                let git_root = workdir.to_string_lossy().to_string();
-                tracing::info!("Discovered git root: {}", git_root);
-                git_root
-            } else {
-                tracing::info!("Git repository is bare, using base path: {}", base_path);
-                base_path
-            }
-        }
-        Err(_) => {
-            tracing::info!(
-                "No git repository found, indexing from base path: {}",
-                base_path
+    // Guard 1: --require-git-root refuses to start when no git workdir is
+    // resolvable from the base path. This prevents accidentally indexing a
+    // user's home directory or a non-repo umbrella directory.
+    if args.require_git_root && !has_git_root {
+        emit_startup_error_and_exit(
+            "NO_GIT_ROOT",
+            &base_path,
+            "no git repository found at or above the base path; \
+             pass --no-require-git-root or unset FFF_REQUIRE_GIT_ROOT to index without a git root",
+        );
+    }
+
+    // Guard 2: --root-must-be-under <prefix> allowlist. If any prefix is
+    // configured, the resolved base path MUST be a descendant of at least
+    // one of them.
+    if !args.root_must_be_under.is_empty() {
+        let base = std::path::Path::new(&base_path);
+        let allowed = args
+            .root_must_be_under
+            .iter()
+            .any(|prefix| base.starts_with(prefix));
+        if !allowed {
+            let detail = format!(
+                "base path is not under any of the configured allowlist prefixes: {:?}",
+                args.root_must_be_under
             );
-            base_path
+            emit_startup_error_and_exit("ROOT_NOT_ALLOWED", &base_path, &detail);
         }
-    };
+    }
+
+    // --validate-root: run only the cheap pre-scan checks above and exit
+    // cleanly. Wrapper scripts use this to probe a candidate base path
+    // without paying for the full walk.
+    if args.validate_root {
+        println!(
+            "OK: base_path={base_path}, has_git_root={has_git_root}, \
+             max_indexable_files={}",
+            args.max_indexable_files
+        );
+        return Ok(());
+    }
+
+    let log_file = args.log_file.as_deref().unwrap_or("");
+    if let Err(e) = fff::log::init_tracing(log_file, args.log_level.as_deref()) {
+        eprintln!("Warning: Failed to init tracing: {}", e);
+    }
+
+    if has_git_root {
+        tracing::info!("Discovered git root: {}", base_path);
+    } else {
+        tracing::info!(
+            "No git repository found, indexing from base path: {}",
+            base_path
+        );
+    }
 
     let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
@@ -256,6 +394,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         !args.no_warmup
     };
 
+    // Capture base_path for use after the move into FilePickerOptions.
+    let base_path_for_error = base_path.clone();
+    let max_indexable_files = args.max_indexable_files;
+
     // Initialize file picker (spawns background scan + watcher)
     FilePicker::new_with_shared_state(
         shared_picker.clone(),
@@ -270,6 +412,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .max_cached_files
                 .map(fff::ContentCacheBudget::new_for_repo),
             follow_symlinks: false,
+            max_indexable_files,
         },
     )
     .map_err(|e| format!("Failed to init file picker: {}", e))?;
@@ -281,18 +424,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create and start the MCP server
     let server = FffServer::new(shared_picker.clone(), shared_frecency.clone());
 
-    // Wait for initial scan in background — don't block server startup
+    // Wait for initial scan in background. When the scan completes we also
+    // check whether it failed fatally (e.g. `Error::TooManyFiles`); on
+    // failure we emit a structured stderr error and exit non-zero so the MCP
+    // host (Claude Code) sees the cause rather than a silent empty index.
     let picker_clone_for_scan = shared_picker.clone();
+    let base_path_for_error_clone = base_path_for_error.clone();
     tokio::task::spawn_blocking(move || {
         let start = std::time::Instant::now();
         loop {
-            let is_scanning = picker_clone_for_scan
+            let (is_scanning, scan_error) = picker_clone_for_scan
                 .read()
                 .ok()
-                .and_then(|g| g.as_ref().map(|p| p.is_scan_active()))
-                .unwrap_or(true);
+                .and_then(|g| {
+                    g.as_ref().map(|p| (p.is_scan_active(), p.scan_error()))
+                })
+                .unwrap_or((true, None));
 
             if !is_scanning {
+                if let Some(detail) = scan_error {
+                    // The scan thread already logged via tracing; surface a
+                    // machine-parseable error and terminate the process.
+                    let code = if detail.starts_with("Too many files") {
+                        "TOO_MANY_FILES"
+                    } else {
+                        "SCAN_FAILED"
+                    };
+                    emit_startup_error_and_exit(
+                        code,
+                        &base_path_for_error_clone,
+                        &detail,
+                    );
+                }
                 tracing::info!("Initial scan completed in {:?}", start.elapsed());
                 break;
             }

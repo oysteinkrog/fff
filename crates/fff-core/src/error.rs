@@ -91,6 +91,13 @@ pub enum Error {
 
     #[error("libgit2 error occurred: {0}")]
     Git(#[from] git2::Error),
+
+    #[error(
+        "Too many files: found {count} files, limit is {limit}. \
+         Refusing to index a tree this large — pass --max-indexable-files \
+         to raise the limit, or 0 to disable."
+    )]
+    TooManyFiles { count: usize, limit: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

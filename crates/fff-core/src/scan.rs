@@ -29,6 +29,13 @@ pub(crate) struct ScanSignals {
     /// DO NOT set or clear this manually — it is managed exclusively by the
     /// PostScanSnapshot lifecycle.
     pub(crate) post_scan_indexing_active: Arc<AtomicBool>,
+    /// Holds the fatal error from a failed initial walk, if any.
+    /// Used by the MCP binary's startup polling loop to detect that the
+    /// initial scan refused to run (e.g. `Error::TooManyFiles`) so it can
+    /// emit a structured stderr error and exit non-zero. Background rescans
+    /// also write here on failure but a non-empty value does not necessarily
+    /// mean the picker is unusable — callers should treat this as advisory.
+    pub(crate) scan_error: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 /// Which optional phases a scan should run.
@@ -37,6 +44,7 @@ pub(crate) struct ScanConfig {
     pub(crate) warmup: bool,
     pub(crate) content_indexing: bool,
     pub(crate) watch: bool,
+    pub(crate) max_indexable_files: usize,
     pub(crate) auto_cache_budget: bool,
     pub(crate) install_watcher: bool,
     pub(crate) follow_symlinks: bool,
@@ -89,6 +97,7 @@ impl ScanJob {
             auto_cache_budget: !picker.has_explicit_cache_budget(),
             install_watcher: false, // the watcher is independent of rescan, it is not restarting EVER
             follow_symlinks: picker.follows_symlinks(),
+            max_indexable_files: picker.max_indexable_files(),
         };
 
         drop(guard); // just a sanity check
@@ -160,10 +169,15 @@ impl ScanJob {
             &shared_frecency,
             mode,
             config.follow_symlinks,
+            config.max_indexable_files,
         ) {
             Ok(sync) => sync,
             Err(e) => {
                 error!(?e, "scan walk failed");
+                // Surface the failure to the startup polling loop. The mutex
+                // here is short-lived (one write per scan) and is never held
+                // across the actual walk.
+                *signals.scan_error.lock() = Some(e.to_string());
                 return;
             }
         };

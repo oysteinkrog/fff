@@ -30,3 +30,4 @@ scripts/benchmark-results/
 
 # Test logs
 fff-test.log
+.planning/

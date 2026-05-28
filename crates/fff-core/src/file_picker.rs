@@ -446,6 +446,11 @@ pub struct FilePickerOptions {
     pub watch: bool,
     /// Follow symbolic links during file indexing.
     pub follow_symlinks: bool,
+    /// Refuse to start if the initial walk discovers more than this many files.
+    /// `0` disables the cap. Defaults to `0` (no limit) so existing callers
+    /// (Neovim plugin, library users) are unaffected. The MCP binary sets
+    /// this to a non-zero default via its CLI flag.
+    pub max_indexable_files: usize,
 }
 
 impl Default for FilePickerOptions {
@@ -458,6 +463,7 @@ impl Default for FilePickerOptions {
             cache_budget: None,
             watch: true,
             follow_symlinks: false,
+            max_indexable_files: 0,
         }
     }
 }
@@ -475,6 +481,7 @@ pub struct FilePicker {
     enable_content_indexing: bool,
     watch: bool,
     follow_symlinks: bool,
+    max_indexable_files: usize,
 }
 
 impl std::fmt::Debug for FilePicker {
@@ -530,6 +537,19 @@ impl FilePicker {
 
     pub fn follows_symlinks(&self) -> bool {
         self.follow_symlinks
+    }
+
+    /// Maximum file count the initial walk is allowed to discover before
+    /// `Error::TooManyFiles` is returned. `0` means no limit.
+    pub fn max_indexable_files(&self) -> usize {
+        self.max_indexable_files
+    }
+
+    /// Returns the stringified error from a failed initial walk, if any.
+    /// Cleared by the next successful scan via `commit_new_sync`. Used by
+    /// the MCP binary's startup polling loop to detect fatal scan failure.
+    pub fn scan_error(&self) -> Option<String> {
+        self.signals.scan_error.lock().clone()
     }
 
     pub fn mode(&self) -> FFFMode {
@@ -726,6 +746,7 @@ impl FilePicker {
             enable_content_indexing: options.enable_content_indexing,
             watch: options.watch,
             follow_symlinks: options.follow_symlinks,
+            max_indexable_files: options.max_indexable_files,
         })
     }
 
@@ -751,6 +772,7 @@ impl FilePicker {
         let watch = picker.watch;
         let mode = picker.mode;
         let follow_symlinks = picker.follow_symlinks;
+        let max_indexable_files = picker.max_indexable_files;
 
         let signals = picker.scan_signals();
         let scanned_files_counter = picker.scanned_files_counter();
@@ -778,6 +800,7 @@ impl FilePicker {
                 auto_cache_budget: true,
                 install_watcher: true,
                 follow_symlinks,
+                max_indexable_files,
             },
         )
         .spawn();
@@ -808,6 +831,7 @@ impl FilePicker {
             &empty_frecency,
             self.mode,
             self.follow_symlinks,
+            self.max_indexable_files,
         )?;
 
         self.sync_data = sync;
@@ -1725,6 +1749,7 @@ impl FileSync {
         shared_frecency: &SharedFrecency,
         mode: FFFMode,
         follow_symlinks: bool,
+        max_indexable_files: usize,
     ) -> Result<FileSync, Error> {
         use ignore::WalkBuilder;
 
@@ -1763,8 +1788,16 @@ impl FileSync {
             let pairs = &pairs;
             let counter = Arc::clone(synced_files_count);
             let base_path = base_path.to_path_buf();
+            let limit = max_indexable_files;
 
             Box::new(move |result| {
+                // Early-abort across all parallel walker threads when the
+                // configured file-count cap is exceeded. `WalkState::Quit`
+                // signals the walker pool to stop dispatching new work.
+                if limit > 0 && counter.load(Ordering::Relaxed) > limit {
+                    return ignore::WalkState::Quit;
+                }
+
                 let Ok(entry) = result else {
                     return ignore::WalkState::Continue;
                 };
@@ -1793,6 +1826,21 @@ impl FileSync {
             })
         });
         drop(walker_span);
+
+        // After the parallel walk has fully drained, surface the cap as an
+        // error so the caller can decide whether to bail or carry on. Doing
+        // this after the walk (rather than inside the closure) lets the cap
+        // act as a hard guard — the caller never sees a partial file list
+        // that looks like a complete index of a smaller repo.
+        if max_indexable_files > 0 {
+            let count = synced_files_count.load(Ordering::Relaxed);
+            if count > max_indexable_files {
+                return Err(Error::TooManyFiles {
+                    count,
+                    limit: max_indexable_files,
+                });
+            }
+        }
 
         let mut pairs = pairs.into_inner();
         info!(

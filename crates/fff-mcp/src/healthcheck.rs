@@ -36,7 +36,9 @@ pub fn run_healthcheck(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    // 2. Git repository
+    // 2. Git repository — `--require-git-root` promotes "not found" to a
+    //    hard failure so `--healthcheck --require-git-root` accurately
+    //    predicts whether the real startup would refuse to run.
     match Repository::discover(&base_path) {
         Ok(repo) => {
             if let Some(workdir) = repo.workdir() {
@@ -46,12 +48,39 @@ pub fn run_healthcheck(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Err(_) => {
-            // Not fatal — fff-mcp works without git, but worth flagging.
-            warn(
-                "Git repository",
-                "not found (fff-mcp will still work, but git-status features are disabled)",
-            );
+            if args.require_git_root {
+                all_ok &= check(
+                    "Git repository",
+                    false,
+                    "not found and --require-git-root is set (startup would refuse)",
+                );
+            } else {
+                warn(
+                    "Git repository",
+                    "not found (fff-mcp will still work, but git-status features are disabled)",
+                );
+            }
         }
+    }
+
+    // 2b. Root allowlist — when `--root-must-be-under` is configured the
+    //     resolved base path must be under at least one prefix; mirror the
+    //     check the binary will run at startup.
+    if !args.root_must_be_under.is_empty() {
+        let base = std::path::Path::new(&base_path);
+        let allowed = args
+            .root_must_be_under
+            .iter()
+            .any(|prefix| base.starts_with(prefix));
+        all_ok &= check(
+            "Root allowlist",
+            allowed,
+            if allowed {
+                "base path is under a configured prefix"
+            } else {
+                "base path is not under any configured prefix (startup would refuse)"
+            },
+        );
     }
 
     // 3. Frecency database

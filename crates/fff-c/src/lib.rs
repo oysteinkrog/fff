@@ -271,6 +271,9 @@ pub unsafe extern "C" fn fff_create_instance2(
             mode,
             cache_budget,
             follow_symlinks: false,
+            // Neovim plugin path: no file-count cap. The MCP binary sets a
+            // non-zero default via its CLI flag.
+            max_indexable_files: 0,
         },
     ) {
         return FffResult::err(&format!("Failed to init file picker: {}", e));
@@ -926,6 +929,9 @@ pub unsafe extern "C" fn fff_restart_index(
             mode,
             cache_budget: None,
             follow_symlinks: false,
+            // Restart preserves no cap — the Neovim plugin does not expose
+            // this knob today. fff-mcp owns the MCP-side default.
+            max_indexable_files: 0,
         },
     ) {
         Ok(()) => FffResult::ok_empty(),
