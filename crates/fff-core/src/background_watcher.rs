@@ -5,31 +5,254 @@ use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
 use git2::Repository;
 use notify::event::{AccessKind, AccessMode};
-use notify::{Config, EventKind, EventKindMask, RecursiveMode};
+use notify::{
+    Config, EventKind, EventKindMask, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::time::Duration;
 use tracing::{Level, debug, error, info, warn};
 
-type Debouncer = notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>;
+/// Concrete debouncer for the platform's native event-driven watcher
+/// (inotify / FSEvents / ReadDirectoryChangesW).
+type NativeDebouncer = notify_debouncer_full::Debouncer<RecommendedWatcher, NoCache>;
+/// Concrete debouncer for the periodic polling watcher.
+type PollDebouncer = notify_debouncer_full::Debouncer<PollWatcher, NoCache>;
+
+/// Default polling interval used when the poll backend is active and no
+/// explicit interval was configured. 10 s keeps CPU negligible while making
+/// edits visible to search within ~15 s worst-case (poll + debounce).
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Which filesystem-watching strategy [`BackgroundWatcher`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WatcherBackend {
+    /// Pick automatically from the indexed root's filesystem type: polling on
+    /// DrvFs/9p/CIFS/NFS (where inotify is noisy or unreliable), the native
+    /// event-driven watcher everywhere else. This is the default.
+    #[default]
+    Auto,
+    /// Force the platform-native watcher (inotify / FSEvents / RDCW).
+    Native,
+    /// Force periodic polling regardless of filesystem type.
+    Poll,
+}
+
+impl WatcherBackend {
+    /// Parse a CLI / config string. Unknown values fall back to `Auto`.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "native" => Self::Native,
+            "poll" => Self::Poll,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// Process-global watcher configuration.
+///
+/// fff-mcp runs one process per repo, so a single set-once config is
+/// sufficient and avoids threading two override knobs through
+/// `FilePickerOptions` and its ~30 construction sites. Defaults to `Auto` +
+/// [`DEFAULT_POLL_INTERVAL`]; consumers that never set it (e.g. the Neovim
+/// plugin) get auto-detection for free.
+#[derive(Debug, Clone, Copy)]
+pub struct WatcherConfig {
+    pub backend: WatcherBackend,
+    pub poll_interval: Duration,
+}
+
+impl Default for WatcherConfig {
+    fn default() -> Self {
+        Self {
+            backend: WatcherBackend::Auto,
+            poll_interval: DEFAULT_POLL_INTERVAL,
+        }
+    }
+}
+
+static WATCHER_CONFIG: OnceLock<WatcherConfig> = OnceLock::new();
+
+/// Install the process-global [`WatcherConfig`]. Call once at startup before
+/// any [`FilePicker`](crate::file_picker::FilePicker) spawns its watcher;
+/// later calls are ignored.
+pub fn set_watcher_config(config: WatcherConfig) {
+    if WATCHER_CONFIG.set(config).is_err() {
+        warn!("Watcher config already set; ignoring later override");
+    }
+}
+
+fn watcher_config() -> WatcherConfig {
+    if let Some(cfg) = WATCHER_CONFIG.get() {
+        return *cfg;
+    }
+
+    // Fallback to environment when no explicit config was installed (e.g. unit
+    // tests, the Neovim plugin). Lets `FFF_WATCHER_BACKEND=native` keep the
+    // event-driven watcher under test on WSL, where the rootfs is wslfs and
+    // `Auto` would otherwise resolve to the slow poll backend.
+    let mut cfg = WatcherConfig::default();
+    if let Ok(backend) = std::env::var("FFF_WATCHER_BACKEND") {
+        cfg.backend = WatcherBackend::parse(&backend);
+    }
+    if let Ok(secs) = std::env::var("FFF_POLL_INTERVAL_SECS")
+        && let Ok(secs) = secs.parse::<u64>()
+        && secs > 0
+    {
+        cfg.poll_interval = Duration::from_secs(secs);
+    }
+    cfg
+}
+
+/// Type-erased debouncer so [`BackgroundWatcher`] can hold either backend in a
+/// single field. `Debouncer<RecommendedWatcher, _>` and `Debouncer<PollWatcher,
+/// _>` are distinct concrete types.
+enum AnyDebouncer {
+    Native(NativeDebouncer),
+    Poll(PollDebouncer),
+}
+
+impl AnyDebouncer {
+    /// Register a directory discovered at runtime.
+    ///
+    /// Only meaningful for the native inotify backend, which watches each
+    /// directory non-recursively. The poll backend watches the base path
+    /// recursively, so new subdirectories are already covered — adding a
+    /// per-dir poll entry would only schedule another full-subtree stat cycle.
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        match self {
+            Self::Native(d) => d.watch(path, mode),
+            Self::Poll(_) => Ok(()),
+        }
+    }
+
+    fn stop_nonblocking(self) {
+        match self {
+            Self::Native(d) => d.stop_nonblocking(),
+            Self::Poll(d) => d.stop_nonblocking(),
+        }
+    }
+}
+
+/// True when `path` lives on a filesystem where inotify/FSEvents are noisy,
+/// unreliable, or absent and a periodic poll is cheaper and more correct.
+///
+/// On WSL1 the entire rootfs is `wslfs`, so this returns true box-wide — which
+/// is exactly right: WSL1 surfaces all Windows-side filesystem activity
+/// (Defender, OneDrive, the Search indexer, MSBuild watchers) as synthetic
+/// inotify events. On WSL2 the Linux rootfs is real ext4 (native inotify
+/// works); only `/mnt/c` is 9p and gets polled.
+#[cfg(target_os = "linux")]
+fn is_polling_preferred_fs(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+
+    // SAFETY: `statfs(2)` only reads kernel metadata into a caller-owned
+    // buffer; `c_path` is a valid NUL-terminated path for the duration of the
+    // call. A non-zero return means the path is unreadable — treat as "native".
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
+        return false;
+    }
+
+    matches!(
+        buf.f_type as u64,
+        0x5346_4846       // WSL1 DrvFs / wslfs (Windows NTFS via the WSL shim)
+            | 0x0102_1997 // V9FS  — WSL2 /mnt/c over 9p, and other 9p mounts
+            | 0xFF53_4D42 // CIFS_SUPER_MAGIC — SMB / Samba shares
+            | 0x6969      // NFS_SUPER_MAGIC
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_polling_preferred_fs(_path: &Path) -> bool {
+    // FSEvents (macOS) and ReadDirectoryChangesW (Windows) are reliable.
+    false
+}
+
+/// Resolve an `Auto` backend against the indexed root's filesystem type.
+fn resolve_backend(backend: WatcherBackend, base_path: &Path) -> WatcherBackend {
+    match backend {
+        WatcherBackend::Auto => {
+            if is_polling_preferred_fs(base_path) {
+                info!(
+                    "Auto-detected polling-preferred filesystem at {}; using PollWatcher",
+                    base_path.display()
+                );
+                WatcherBackend::Poll
+            } else {
+                WatcherBackend::Native
+            }
+        }
+        explicit => explicit,
+    }
+}
+
+/// Cache for the libgit2 `Repository` handle used by event-processing helpers.
+///
+/// Opening a Repository is surprisingly expensive: every call re-reads
+/// `/etc/gitconfig`, the user's `~/.gitconfig`, and the repo's own
+/// `.git/config`, then walks the worktree to resolve `.git` indirection. On a
+/// shared `.git/` (e.g. multiple git worktrees fed from one common dir), the
+/// debouncer batches fire many times per second, and the per-batch open
+/// dominated watcher CPU in profiling (~16 opens/sec/watcher on Linux with
+/// libgit2 0.20.x).
+///
+/// The handle is kept alive across batches and shared between the debouncer's
+/// callback thread and the owner thread via the parking_lot mutex. The mutex
+/// is held only while the helper actually uses the repository (one debounced
+/// batch or one `track_files_from_new_directories` call), which keeps
+/// contention negligible.
+#[derive(Clone)]
+struct GitRepoCache {
+    workdir: Option<PathBuf>,
+    repo: Arc<Mutex<Option<Repository>>>,
+}
+
+impl GitRepoCache {
+    fn new(workdir: Option<PathBuf>) -> Self {
+        let repo = workdir.as_deref().and_then(|p| Repository::open(p).ok());
+        Self {
+            workdir,
+            repo: Arc::new(Mutex::new(repo)),
+        }
+    }
+
+    /// Run `f` with a borrow of the cached repository.
+    ///
+    /// If the cache slot is empty (initial open failed, or a previous caller
+    /// invalidated it), this attempts to re-open from `workdir` while holding
+    /// the lock so concurrent callers don't race on the open.
+    fn with_repo<R>(&self, f: impl FnOnce(&Option<Repository>) -> R) -> R {
+        let mut guard = self.repo.lock();
+        if guard.is_none()
+            && let Some(workdir) = self.workdir.as_deref()
+        {
+            *guard = Repository::open(workdir).ok();
+        }
+        f(&*guard)
+    }
+}
 
 /// Owns the file-system watcher and guarantees that all background threads
 /// are fully joined before `stop()` / `Drop` returns.
 pub struct BackgroundWatcher {
-    debouncer: Arc<Mutex<Option<Debouncer>>>,
+    debouncer: Arc<Mutex<Option<AnyDebouncer>>>,
     watch_tx: Option<mpsc::Sender<PathBuf>>,
     owner_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(50);
 const MAX_PATHS_THRESHOLD: usize = 1024;
-/// On macOS, each `watch()` call creates a separate FSEventStream. When the
-/// number of directories exceeds this threshold we fall back to a single
-/// recursive watch to avoid exhausting the per-process stream limit.
-const MAX_MACOS_NONRECURSIVE_WATCHES: usize = 4096;
 /// Minimum seconds between frecency tracks of the same file in AI mode.
 /// Prevents score inflation from rapid burst edits by AI agents.
 const AI_MODE_COOLDOWN_SECS: u64 = 5 * 60;
@@ -78,12 +301,27 @@ impl BackgroundWatcher {
         // get by iterating `picker.for_each_dir` ourselves.
         let use_recursive = cfg!(any(target_os = "macos", target_os = "windows"));
 
+        // Resolve the process-global watcher config against this root's
+        // filesystem. On DrvFs/9p/CIFS/NFS this flips to PollWatcher, which
+        // makes the inotify event storm — and the rescan/git-status spin it
+        // drives — physically impossible.
+        let WatcherConfig {
+            backend,
+            poll_interval,
+        } = watcher_config();
+        let effective_backend = resolve_backend(backend, &base_path);
+
         let (watch_tx, watch_rx) = mpsc::channel::<PathBuf>();
         let watch_tx_for_debouncer = watch_tx.clone();
 
         let owner_weak_picker = shared_picker.weaken();
         let owner_frecency = shared_frecency.clone();
-        let owner_git_workdir = git_workdir.clone();
+
+        // Shared, lazily-opened Repository handle. Two consumers — the
+        // debouncer's event handler and the owner thread — would otherwise
+        // each call `Repository::open` per batch / per new directory.
+        let repo_cache = GitRepoCache::new(git_workdir.clone());
+        let owner_repo_cache = repo_cache.clone();
 
         let debouncer = Self::create_debouncer(
             base_path,
@@ -93,6 +331,9 @@ impl BackgroundWatcher {
             mode,
             use_recursive,
             watch_tx_for_debouncer,
+            repo_cache,
+            effective_backend,
+            poll_interval,
         )?;
 
         info!("Background file watcher initialized successfully");
@@ -107,7 +348,22 @@ impl BackgroundWatcher {
         let owner_thread = std::thread::Builder::new()
             .name("fff-watcher-own".into())
             .spawn(move || {
+                // Dedup re-emitted Create(Folder) events. notify-rs occasionally
+                // re-reports a directory it already streamed (observed on
+                // wslfs/inotify in particular), and registering a duplicate
+                // watch + re-walking the directory contents is the second
+                // biggest source of owner-thread CPU after `Repository::open`.
+                let mut watched_dirs: HashSet<PathBuf> = HashSet::new();
+
                 while let Ok(dir) = watch_rx.recv() {
+                    if !watched_dirs.insert(dir.clone()) {
+                        debug!(
+                            dir = %dir.display(),
+                            "Skipping already-watched directory"
+                        );
+                        continue;
+                    }
+
                     // if the picker is dropped we do need to exit the loop
                     let Some(strong_picker) = owner_weak_picker.upgrade() else {
                         break;
@@ -144,7 +400,7 @@ impl BackgroundWatcher {
                         &dir,
                         &strong_picker,
                         &owner_frecency,
-                        &owner_git_workdir,
+                        &owner_repo_cache,
                     );
 
                     // Transient strong ref drops here, back
@@ -162,6 +418,9 @@ impl BackgroundWatcher {
         })
     }
 
+    // Construction needs the full watcher context; bundling into a struct
+    // would add indirection without clarity for a single private call site.
+    #[allow(clippy::too_many_arguments)]
     fn create_debouncer(
         base_path: PathBuf,
         git_workdir: Option<PathBuf>,
@@ -170,8 +429,11 @@ impl BackgroundWatcher {
         mode: FFFMode,
         use_recursive: bool,
         watch_tx: mpsc::Sender<PathBuf>,
-    ) -> Result<Debouncer, Error> {
-        let config = Config::default()
+        repo_cache: GitRepoCache,
+        effective_backend: WatcherBackend,
+        poll_interval: Duration,
+    ) -> Result<AnyDebouncer, Error> {
+        let base_config = Config::default()
             // do not follow symlinks as then notifiers spawns a bunch of events for symlinked
             // files that could be git ignored, we have to property differentiate those and if
             // the file was edited through a
@@ -189,152 +451,88 @@ impl BackgroundWatcher {
         // `SharedFilePicker` here would re-introduce the Arc cycle
         // we just broke with `owner_picker`'s `downgrade()` above.
         // Capture a weak handle instead and upgrade per-batch.
-        let git_workdir_for_handler = git_workdir.clone();
         let shared_picker_for_watching = shared_picker.clone();
         let event_picker = shared_picker.weaken();
-        let mut debouncer = new_debouncer_opt(
-            DEBOUNCE_TIMEOUT,
-            Some(DEBOUNCE_TIMEOUT / 2), // tick rate for the event span
-            {
-                move |result: DebounceEventResult| match result {
-                    Ok(events) => {
-                        // Upgrade just long enough to drive one
-                        // debounced batch. Failure means every
-                        // external `SharedFilePicker` has already
-                        // dropped and teardown is already underway.
-                        let Some(strong_picker) = event_picker.upgrade() else {
-                            return;
-                        };
+        let handler_repo_cache = repo_cache;
+        // The event-handler closure lives on the debouncer's internal event
+        // thread for the full lifetime of `BackgroundWatcher`. It upgrades the
+        // *weak* `SharedFilePicker` per batch, so it never forms an Arc cycle
+        // with the picker that owns this watcher.
+        //
+        // Built once and moved into whichever backend is constructed below. The
+        // two match arms are mutually exclusive, so moving `handler` — and
+        // `base_config` — in each arm is sound.
+        let handler = move |result: DebounceEventResult| match result {
+            Ok(events) => {
+                // Upgrade just long enough to drive one debounced batch.
+                // Failure means every external `SharedFilePicker` has already
+                // dropped and teardown is underway.
+                let Some(strong_picker) = event_picker.upgrade() else {
+                    return;
+                };
 
-                        let new_dirs = handle_debounced_events(
-                            events,
-                            &git_workdir_for_handler,
-                            &strong_picker,
-                            &shared_frecency,
-                            mode,
-                        );
+                let new_dirs = handle_debounced_events(
+                    events,
+                    &strong_picker,
+                    &shared_frecency,
+                    mode,
+                    &handler_repo_cache,
+                );
 
-                        // every new directory creates had to be reflected in the picker state
-                        for dir in new_dirs {
-                            if let Err(e) = watch_tx.send(dir) {
-                                warn!(?e, "Failed to send directory update error");
-                            }
-                        }
-                    }
-                    Err(errors) => {
-                        error!("File watcher errors: {:?}", errors);
+                // Every newly created directory must be reflected in the picker.
+                for dir in new_dirs {
+                    if let Err(e) = watch_tx.send(dir) {
+                        warn!(?e, "Failed to send directory update error");
                     }
                 }
-            },
-            // There is an issue with recommended cache implementation on macos
-            // it keeps track of all the files added to the watcher which is not a problem
-            // for us because any rename to the file will anyway require the removing from the
-            // ordedred index and adding it back with the new name
-            NoCache::new(),
-            config,
-        )?;
-
-        // Watching strategy:
-        //
-        // For small-to-medium repos we watch each indexed directory individually
-        // (NonRecursive). This avoids receiving events for gitignored paths like
-        // node_modules/ and keeps the event volume low.
-        //
-        // On macOS, each `watch()` call creates a separate FSEventStream. Large
-        // repos (e.g. Chromium with 487K+ files) can have tens of thousands of
-        // directories, which exhausts the per-process FSEvents stream limit and
-        // causes "unable to start FSEvent stream" errors. When the directory
-        // count exceeds the threshold we fall back to a single Recursive watch
-        // on the base path. FSEvents handles this efficiently with one kernel
-        // stream for the entire subtree. Gitignored paths are already filtered
-        // in the event handler via `should_include_file()`.
-        //
-        // On Linux (inotify), RecursiveMode::Recursive creates one kernel watch
-        // per subdirectory *including* gitignored ones, wasting file descriptors.
-        // The per-directory NonRecursive approach is always used on Linux.
-        //
-        // New directories created at runtime are detected via Create events on
-        // the parent and dynamically added by the owner thread via watch_tx.
-
-        if use_recursive {
-            debouncer.watch(base_path.as_path(), RecursiveMode::Recursive)?;
-            info!(
-                "File watcher initialized with single recursive watch on {} \
-                 (exceeded threshold of {})",
-                base_path.display(),
-                MAX_MACOS_NONRECURSIVE_WATCHES,
-            );
-        } else {
-            debouncer.watch(base_path.as_path(), RecursiveMode::NonRecursive)?;
-
-            // Stream watch-dir registration directly under the picker
-            // read lock. Only Linux (inotify) reaches this branch —
-            // macOS always takes the recursive path above. `inotify`'s
-            // `inotify_add_watch()` is fast-fail: on ENOSPC it returns
-            // immediately, no kernel retry loop, so holding the read
-            // lock across the stream is O(ms) even for large repos.
-            //
-            // Abort the loop after a run of failures. Once ENOSPC hits,
-            // further calls won't succeed until the user raises
-            // `fs.inotify.max_user_watches`, so there's no value in
-            // continuing.
-            const MAX_CONSECUTIVE_WATCH_FAILURES: usize = 16;
-
-            let mut watched = 0usize;
-            let mut consecutive_failures = 0usize;
-            let mut aborted_early = false;
-
-            if let Some(guard) = shared_picker_for_watching.read().ok()
-                && let Some(picker) = guard.as_ref()
-            {
-                use std::ops::ControlFlow;
-                picker.for_each_dir(|dir| {
-                    match debouncer.watch(dir, RecursiveMode::NonRecursive) {
-                        Ok(()) => {
-                            watched += 1;
-                            consecutive_failures = 0;
-                            ControlFlow::Continue(())
-                        }
-                        Err(e) => {
-                            consecutive_failures += 1;
-                            if consecutive_failures <= 4 {
-                                warn!("Failed to watch directory {}: {}", dir.display(), e);
-                            }
-
-                            if consecutive_failures >= MAX_CONSECUTIVE_WATCH_FAILURES {
-                                warn!(
-                                    consecutive_failures,
-                                    watched,
-                                    "Aborting NonRecursive watch loop — per-process \
-                                 watch cap exhausted, further dirs would just burn \
-                                 kernel time for no coverage"
-                                );
-                                aborted_early = true;
-                                ControlFlow::Break(())
-                            } else {
-                                ControlFlow::Continue(())
-                            }
-                        }
-                    }
-                });
             }
+            Err(errors) => {
+                error!("File watcher errors: {:?}", errors);
+            }
+        };
 
-            info!(
-                "File watcher initialized for {} directories (NonRecursive) under {} (aborted_early={})",
-                watched,
-                base_path.display(),
-                aborted_early,
-            );
-        }
+        // The poll backend does a single recursive stat sweep of the base path,
+        // so one recursive watch covers the whole subtree with no per-dir
+        // overhead — it must never fan out into per-directory poll entries.
+        let recursive = use_recursive || matches!(effective_backend, WatcherBackend::Poll);
 
-        // The .git directory is excluded from the file list but we still need
-        // to observe changes that affect git status (staging, unstaging,
-        // committing, branch switches, merges, etc.).
-        // When using recursive mode the base watch already covers .git/,
-        // but these targeted watches are cheap (at most 3 extra streams)
-        // and ensure we catch status changes even if the recursive backend
-        // coalesces or delays .git events.
-        watch_git_status_paths(&mut debouncer, git_workdir.as_ref());
+        // `NoCache`: the debouncer's recommended file-id cache would track every
+        // watched file for no benefit — any rename already forces an index
+        // remove + re-add under the new name.
+        let debouncer = match effective_backend {
+            WatcherBackend::Poll => {
+                // PollWatcher rate-limits via `poll_interval`; the debounce on
+                // top (timeout = interval/2) just coalesces one sweep's events.
+                let config = base_config.with_poll_interval(poll_interval);
+                let mut debouncer = new_debouncer_opt::<_, PollWatcher, _>(
+                    poll_interval / 2,
+                    Some(poll_interval / 4),
+                    handler,
+                    NoCache::new(),
+                    config,
+                )?;
+                info!(
+                    "Background watcher using PollWatcher (interval {:?}) for {}",
+                    poll_interval,
+                    base_path.display(),
+                );
+                setup_watches(&mut debouncer, &base_path, recursive, &shared_picker_for_watching)?;
+                watch_git_status_paths(&mut debouncer, git_workdir.as_ref());
+                AnyDebouncer::Poll(debouncer)
+            }
+            _ => {
+                let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, _>(
+                    DEBOUNCE_TIMEOUT,
+                    Some(DEBOUNCE_TIMEOUT / 2), // tick rate for the event span
+                    handler,
+                    NoCache::new(),
+                    base_config,
+                )?;
+                setup_watches(&mut debouncer, &base_path, recursive, &shared_picker_for_watching)?;
+                watch_git_status_paths(&mut debouncer, git_workdir.as_ref());
+                AnyDebouncer::Native(debouncer)
+            }
+        };
 
         Ok(debouncer)
     }
@@ -392,16 +590,34 @@ impl Drop for BackgroundWatcher {
     }
 }
 
-#[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency), level = Level::DEBUG)]
+#[tracing::instrument(
+    name = "fs_events",
+    skip(events, shared_picker, shared_frecency, repo_cache),
+    level = Level::DEBUG,
+)]
 fn handle_debounced_events(
     events: Vec<DebouncedEvent>,
-    git_workdir: &Option<PathBuf>,
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
     mode: FFFMode,
+    repo_cache: &GitRepoCache,
 ) -> Vec<PathBuf> {
-    // this will be called very often, we have to minimiy the lock time for file picker
-    let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
+    // This will be called very often. The libgit2 `Repository` handle is
+    // cached for the lifetime of the watcher — see `GitRepoCache` — so we
+    // hold the lock for the duration of this batch and feed `&Option<Repository>`
+    // to the existing helpers unchanged.
+    repo_cache.with_repo(|repo| {
+        handle_debounced_events_inner(events, shared_picker, shared_frecency, mode, repo)
+    })
+}
+
+fn handle_debounced_events_inner(
+    events: Vec<DebouncedEvent>,
+    shared_picker: &SharedFilePicker,
+    shared_frecency: &SharedFrecency,
+    mode: FFFMode,
+    repo: &Option<Repository>,
+) -> Vec<PathBuf> {
     let mut need_full_rescan = false;
     let mut need_full_git_rescan = false;
     let mut paths_to_remove = Vec::new();
@@ -703,13 +919,30 @@ fn track_files_from_new_directories(
     dir: &Path,
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
-    git_workdir: &Option<PathBuf>,
+    repo_cache: &GitRepoCache,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
 
-    let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
+    repo_cache.with_repo(|repo| {
+        track_files_from_new_directories_inner(
+            dir,
+            entries,
+            shared_picker,
+            shared_frecency,
+            repo,
+        )
+    })
+}
+
+fn track_files_from_new_directories_inner(
+    dir: &Path,
+    entries: std::fs::ReadDir,
+    shared_picker: &SharedFilePicker,
+    shared_frecency: &SharedFrecency,
+    repo: &Option<Repository>,
+) {
     let mut files_to_add = Vec::new();
 
     for entry in entries.flatten() {
@@ -841,7 +1074,96 @@ fn is_ignore_definition_path(path: &Path) -> bool {
     )
 }
 
-fn watch_git_status_paths(debouncer: &mut Debouncer, git_workdir: Option<&PathBuf>) {
+/// Register the initial set of watches on `debouncer`.
+///
+/// When `recursive` is true (macOS/Windows native streams, or any poll
+/// backend) a single recursive watch on `base_path` covers the whole subtree.
+/// Otherwise (Linux inotify) we register one NonRecursive watch per indexed
+/// directory: inotify has no kernel-level recursion, and per-dir watches let
+/// us skip gitignored subtrees and keep the kernel watch count bounded.
+///
+/// New directories created at runtime are picked up via Create events on the
+/// parent and added by the owner thread (native backend only).
+fn setup_watches<T: Watcher>(
+    debouncer: &mut notify_debouncer_full::Debouncer<T, NoCache>,
+    base_path: &Path,
+    recursive: bool,
+    shared_picker_for_watching: &SharedFilePicker,
+) -> Result<(), Error> {
+    if recursive {
+        debouncer.watch(base_path, RecursiveMode::Recursive)?;
+        info!(
+            "File watcher initialized with single recursive watch on {}",
+            base_path.display(),
+        );
+        return Ok(());
+    }
+
+    debouncer.watch(base_path, RecursiveMode::NonRecursive)?;
+
+    // Stream watch-dir registration directly under the picker read lock.
+    // `inotify_add_watch()` is fast-fail: on ENOSPC it returns immediately with
+    // no kernel retry loop, so holding the read lock across the loop is O(ms)
+    // even for large repos.
+    //
+    // Abort after a run of failures. Once ENOSPC hits, further calls won't
+    // succeed until the user raises `fs.inotify.max_user_watches`, so there's
+    // no value in continuing.
+    const MAX_CONSECUTIVE_WATCH_FAILURES: usize = 16;
+
+    let mut watched = 0usize;
+    let mut consecutive_failures = 0usize;
+    let mut aborted_early = false;
+
+    if let Some(guard) = shared_picker_for_watching.read().ok()
+        && let Some(picker) = guard.as_ref()
+    {
+        use std::ops::ControlFlow;
+        picker.for_each_dir(|dir| {
+            match debouncer.watch(dir, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    watched += 1;
+                    consecutive_failures = 0;
+                    ControlFlow::Continue(())
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures <= 4 {
+                        warn!("Failed to watch directory {}: {}", dir.display(), e);
+                    }
+
+                    if consecutive_failures >= MAX_CONSECUTIVE_WATCH_FAILURES {
+                        warn!(
+                            consecutive_failures,
+                            watched,
+                            "Aborting NonRecursive watch loop — per-process \
+                             watch cap exhausted, further dirs would just burn \
+                             kernel time for no coverage"
+                        );
+                        aborted_early = true;
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                }
+            }
+        });
+    }
+
+    info!(
+        "File watcher initialized for {} directories (NonRecursive) under {} (aborted_early={})",
+        watched,
+        base_path.display(),
+        aborted_early,
+    );
+
+    Ok(())
+}
+
+fn watch_git_status_paths<T: Watcher>(
+    debouncer: &mut notify_debouncer_full::Debouncer<T, NoCache>,
+    git_workdir: Option<&PathBuf>,
+) {
     let Some(workdir) = git_workdir else {
         return;
     };

@@ -143,6 +143,7 @@ mod ignore;
 /// and [`QueryTracker`].
 pub mod shared;
 
+pub use background_watcher::{WatcherBackend, WatcherConfig, set_watcher_config};
 pub use bigram_filter::*;
 pub use dbs::db_healthcheck::{DbHealth, DbHealthChecker};
 pub use error::{Error, Result};

@@ -15,7 +15,7 @@ mod update_check;
 use clap::Parser;
 use fff::file_picker::FilePicker;
 use fff::frecency::FrecencyTracker;
-use fff::{FFFMode, SharedFilePicker, SharedFrecency};
+use fff::{FFFMode, SharedFilePicker, SharedFrecency, WatcherBackend, WatcherConfig};
 use git2::Repository;
 use mimalloc::MiMalloc;
 use rmcp::{ServiceExt, transport::stdio};
@@ -149,6 +149,21 @@ pub(crate) struct Args {
     #[arg(long = "no-watch")]
     no_watch: bool,
 
+    /// File-system watcher backend: `auto` (default), `native`, or `poll`.
+    /// `auto` switches to polling when the indexed root is on DrvFs (WSL),
+    /// 9p, CIFS/SMB, or NFS — where inotify storms or is unreliable — and
+    /// uses the native event-driven watcher (inotify/FSEvents/RDCW) elsewhere.
+    #[arg(long = "watcher-backend", env = "FFF_WATCHER_BACKEND", default_value = "auto")]
+    watcher_backend: String,
+
+    /// Poll interval in seconds when the poll backend is active (default 10).
+    #[arg(
+        long = "poll-interval-secs",
+        env = "FFF_POLL_INTERVAL_SECS",
+        default_value_t = 10
+    )]
+    poll_interval_secs: u64,
+
     /// Maximum number of files whose content is kept persistently in memory.
     /// Files beyond this limit are still searchable via temporary mmaps that
     /// are released after each grep. Defaults to 30 000.
@@ -255,6 +270,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         !args.no_warmup
     };
+
+    // Install the process-global watcher config before the picker spawns its
+    // watcher. On DrvFs/9p/CIFS/NFS, `auto` resolves to PollWatcher, which
+    // eliminates the inotify event storm (and the rescan/git-status spin it
+    // drives) that pegs CPU on WSL.
+    fff::set_watcher_config(WatcherConfig {
+        backend: WatcherBackend::parse(&args.watcher_backend),
+        poll_interval: std::time::Duration::from_secs(args.poll_interval_secs.max(1)),
+    });
 
     // Initialize file picker (spawns background scan + watcher)
     FilePicker::new_with_shared_state(
